@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════╗
-║         URL / IP REPUTATION CHECKER  v1.0               ║
-║         Cybersecurity Terminal Tool  by Claude           ║
-╚══════════════════════════════════════════════════════════╝
+URL & IP Spam Checker — No setup needed, just run and paste your link!
 """
 
 import re
@@ -11,340 +8,242 @@ import sys
 import time
 import socket
 import urllib.parse
-from datetime import datetime
 
+# Auto-install rich if missing
 try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-    from rich.layout import Layout
-    from rich.columns import Columns
+    from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.rule import Rule
     from rich.prompt import Prompt
-    from rich import box
     from rich.align import Align
-    from rich.live import Live
+    from rich import box
     from rich.markup import escape
 except ImportError:
-    print("Installing required libraries...")
     import subprocess
+    print("⏳ Installing display library (one-time setup)...")
     subprocess.run([sys.executable, "-m", "pip", "install", "rich", "--break-system-packages", "-q"])
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-    from rich.columns import Columns
+    from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.rule import Rule
     from rich.prompt import Prompt
-    from rich import box
     from rich.align import Align
-    from rich.live import Live
+    from rich import box
     from rich.markup import escape
-
-try:
-    import anthropic
-except ImportError:
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "anthropic", "--break-system-packages", "-q"])
-    import anthropic
 
 console = Console()
 
-# ─── Constants ───────────────────────────────────────────────────────────────
-
-SUSPICIOUS_TLDS   = {'.tk','.ml','.ga','.cf','.pw','.xyz','.top','.click','.loan','.bid','.win','.gq','.cc','.su'}
-BRAND_KEYWORDS    = ['paypal','apple','google','microsoft','amazon','netflix','bank','secure','login','verify','update','account','confirm','support','webscr']
-TOR_FIRST_OCTETS  = {185, 194, 193, 176, 199, 198, 197, 46}
-PRIVATE_RANGES    = [(10,0,0,0,8),(172,16,0,0,12),(192,168,0,0,16)]
+# ── Known spam/phishing indicators ───────────────────────────────────────────
+SPAM_TLDS        = {'.tk','.ml','.ga','.cf','.pw','.xyz','.top','.click','.loan',
+                    '.bid','.win','.gq','.cc','.su','.icu','.monster','.buzz','.cyou'}
+BRAND_KEYWORDS   = ['paypal','apple','google','microsoft','amazon','netflix','bank',
+                    'secure','login','verify','update','account','confirm','support',
+                    'webscr','signin','ebay','facebook','instagram','icloud','chase',
+                    'wellsfargo','citi','hsbc','dhl','fedex','usps','prize','winner',
+                    'claim','reward','free','lucky','congratulations']
+SAFE_DOMAINS     = {'google.com','youtube.com','facebook.com','instagram.com','twitter.com',
+                    'x.com','github.com','microsoft.com','apple.com','amazon.com',
+                    'wikipedia.org','reddit.com','linkedin.com','netflix.com','stackoverflow.com',
+                    'cloudflare.com','dropbox.com','paypal.com','ebay.com','zoom.us'}
+TOR_OCTETS       = {185, 194, 193, 176, 199, 198, 197}
 
 BANNER = r"""
-  ██████╗ ███████╗██████╗ ██╗   ██╗████████╗ █████╗ ████████╗██╗ ██████╗ ███╗   ██╗
-  ██╔══██╗██╔════╝██╔══██╗██║   ██║╚══██╔══╝██╔══██╗╚══██╔══╝██║██╔═══██╗████╗  ██║
-  ██████╔╝█████╗  ██████╔╝██║   ██║   ██║   ███████║   ██║   ██║██║   ██║██╔██╗ ██║
-  ██╔══██╗██╔══╝  ██╔═══╝ ██║   ██║   ██║   ██╔══██║   ██║   ██║██║   ██║██║╚██╗██║
-  ██║  ██║███████╗██║     ╚██████╔╝   ██║   ██║  ██║   ██║   ██║╚██████╔╝██║ ╚████║
-  ╚═╝  ╚═╝╚══════╝╚═╝      ╚═════╝    ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+ ____  ____   __   __  __     ___  _  _  ____  ___  __ _  ____  ____ 
+/ ___)(  _ \ / _\ (  \/  )   / __)/ )( \(  __)/ __)(  / )( ___)(  _ \
+\___ \ ) __//    \ )    (   ( (__ ) __ ( ) _)( (__  )  (  )__)  )   /
+(____/(__)  \_/\_/(_/\/\_)   \___)\_)(_/(____)\___)(__)_)(____)(__\_)
 """
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def is_ip(t):
+    return bool(re.match(r'^(\d{1,3}\.){3}\d{1,3}$', t.strip())) and \
+           all(0 <= int(x) <= 255 for x in t.strip().split('.'))
 
-def is_ip(target: str) -> bool:
-    pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
-    if not re.match(pattern, target.strip()):
-        return False
-    parts = target.strip().split(".")
-    return all(0 <= int(p) <= 255 for p in parts)
-
-def extract_domain(url: str) -> str:
+def extract_domain(url):
     try:
-        if not url.startswith(("http://", "https://")):
-            url = "http://" + url
+        if not url.startswith(('http://', 'https://')):
+            url = 'http://' + url
         return urllib.parse.urlparse(url).hostname or url
-    except Exception:
+    except:
         return url
 
-def resolve_ip(domain: str) -> str:
+def get_base_domain(domain):
+    parts = domain.split('.')
+    return '.'.join(parts[-2:]) if len(parts) >= 2 else domain
+
+def dns_resolve(domain):
     try:
-        return socket.gethostbyname(domain)
-    except Exception:
-        return "Unresolvable"
+        return socket.gethostbyname(domain), True
+    except:
+        return "Cannot resolve", False
 
-def is_private_ip(parts):
-    p = list(map(int, parts))
-    if p[0] == 10: return True
-    if p[0] == 172 and 16 <= p[1] <= 31: return True
-    if p[0] == 192 and p[1] == 168: return True
-    return False
+# ── Spam Analysis ─────────────────────────────────────────────────────────────
+def check_target(target):
+    target = target.strip()
+    checks = []       # (emoji, name, value, status)  status: ok/warn/bad
+    spam_score = 0
 
-# ─── Heuristic Analysis ──────────────────────────────────────────────────────
+    if is_ip(target):
+        parts = list(map(int, target.split('.')))
+        private  = parts[0]==10 or (parts[0]==172 and 16<=parts[1]<=31) or (parts[0]==192 and parts[1]==168)
+        loopback = parts[0]==127
+        tor_like = parts[0] in TOR_OCTETS
 
-def analyze_ip(ip: str):
-    parts = ip.strip().split(".")
-    ints  = list(map(int, parts))
-    flags = []
+        checks.append(("🌐", "Type",            "IPv4 Address",                      "ok"))
+        checks.append(("🏠", "Private IP",      "Yes – internal network" if private else "No – public IP",   "warn" if private else "ok"))
+        checks.append(("🔁", "Loopback",        "Yes (127.x.x.x)" if loopback else "No",                    "warn" if loopback else "ok"))
+        checks.append(("🧅", "Tor/VPN Range",   "⚠️  Possibly anonymous" if tor_like else "Normal range",    "bad"  if tor_like else "ok"))
+        checks.append(("📍", "Geolocation",     "Use ipinfo.io to verify",           "warn"))
 
-    private  = is_private_ip(parts)
-    loopback = ints[0] == 127
-    tor_like = ints[0] in TOR_FIRST_OCTETS
-    multicast= ints[0] >= 224
+        if tor_like:    spam_score += 40
+        if private:     spam_score += 10
 
-    flags.append(("🌐", "Type",             "IPv4 Address",              "info"))
-    flags.append(("🏠", "Private Range",    "Yes (RFC1918)" if private else "No (Public)", "warn" if private else "ok"))
-    flags.append(("🔁", "Loopback",         "Yes" if loopback else "No",                  "warn" if loopback else "ok"))
-    flags.append(("📡", "Multicast",        "Yes" if multicast else "No",                 "warn" if multicast else "ok"))
-    flags.append(("🧅", "Tor / VPN Range",  "Possible" if tor_like else "Unlikely",       "bad"  if tor_like else "ok"))
-
-    return flags
-
-def analyze_url(url: str):
-    lower  = url.lower()
-    domain = extract_domain(lower)
-    flags  = []
-
-    is_https    = lower.startswith("https://")
-    susp_tld    = any(domain.endswith(t) for t in SUSPICIOUS_TLDS)
-    has_ip_dom  = bool(re.search(r"\d+\.\d+\.\d+\.\d+", domain))
-    parts       = domain.split(".")
-    long_sub    = any(len(p) > 30 for p in parts[:-2]) if len(parts) > 2 else False
-    brand_spoof = any(b in lower for b in BRAND_KEYWORDS)
-    excess_dash = lower.count("-") > 3
-    num_sub     = any(p.isdigit() for p in parts[:-2])
-    path_depth  = lower.count("/") > 5
-    resolved_ip = resolve_ip(domain)
-    resolved_ok = resolved_ip != "Unresolvable"
-
-    flags.append(("🔒", "Protocol",         "HTTPS" if is_https else "HTTP (Insecure)",          "ok"  if is_https    else "warn"))
-    flags.append(("📛", "TLD Risk",         "Suspicious TLD" if susp_tld else "Normal TLD",      "bad" if susp_tld    else "ok"))
-    flags.append(("🔢", "IP in Domain",     "Detected" if has_ip_dom else "None",                "bad" if has_ip_dom  else "ok"))
-    flags.append(("📏", "Long Subdomain",   "Detected" if long_sub else "Normal",                "warn"if long_sub    else "ok"))
-    flags.append(("🏷️", "Brand Spoofing",  "Possible" if brand_spoof else "None Detected",      "bad" if brand_spoof else "ok"))
-    flags.append(("➖", "Excess Dashes",    "Yes" if excess_dash else "No",                      "warn"if excess_dash else "ok"))
-    flags.append(("🔢", "Numeric Subdomain","Yes" if num_sub else "No",                          "warn"if num_sub     else "ok"))
-    flags.append(("🌿", "Deep URL Path",    "Yes (Obfuscation?)" if path_depth else "Normal",    "warn"if path_depth  else "ok"))
-    flags.append(("📡", "DNS Resolution",   resolved_ip if resolved_ok else "Failed",            "ok"  if resolved_ok else "bad"))
-
-    return flags
-
-def compute_score(flags) -> int:
-    score = 100
-    for _, _, _, status in flags:
-        if status == "bad":  score -= 25
-        if status == "warn": score -= 10
-    return max(0, min(100, score))
-
-def score_meta(score: int):
-    if score >= 70:
-        return ("LIKELY SAFE",  "green",  "✅")
-    elif score >= 40:
-        return ("SUSPICIOUS",   "yellow", "⚠️")
     else:
-        return ("HIGH RISK",    "red",    "🚨")
+        domain = extract_domain(target.lower())
+        base   = get_base_domain(domain)
+        lower  = target.lower()
 
-STATUS_COLORS = {"ok": "green", "warn": "yellow", "bad": "red", "info": "cyan"}
+        is_https     = lower.startswith('https://')
+        spam_tld     = any(domain.endswith(t) for t in SPAM_TLDS)
+        ip_in_url    = bool(re.search(r'\d+\.\d+\.\d+\.\d+', domain))
+        long_sub     = any(len(p) > 25 for p in domain.split('.')[:-2])
+        brand_spoof  = any(b in lower for b in BRAND_KEYWORDS) and base not in SAFE_DOMAINS
+        excess_dash  = domain.count('-') > 3
+        num_sub      = any(p.isdigit() for p in domain.split('.')[:-2])
+        deep_path    = lower.count('/') > 6
+        is_trusted   = base in SAFE_DOMAINS
+        resolved_ip, resolved_ok = dns_resolve(domain)
+        url_len_sus  = len(target) > 120
 
-# ─── AI Analysis ─────────────────────────────────────────────────────────────
+        checks.append(("🔒", "HTTPS",            "Secure ✅" if is_https else "Insecure ⚠️",                       "ok"   if is_https    else "warn"))
+        checks.append(("🌐", "Domain",           domain,                                                           "ok"))
+        checks.append(("🛡️", "Trusted Domain",  "Yes – well-known site ✅" if is_trusted else "Not in safe list",  "ok"   if is_trusted  else "warn"))
+        checks.append(("📛", "Suspicious TLD",  f"Yes ({domain.split('.')[-1]}) – often used in spam" if spam_tld else "Normal TLD",  "bad"  if spam_tld   else "ok"))
+        checks.append(("🔢", "IP in URL",        "Yes – suspicious!" if ip_in_url else "No",                       "bad"  if ip_in_url   else "ok"))
+        checks.append(("🏷️", "Brand Spoofing",  "Detected – fake brand name!" if brand_spoof else "None found",   "bad"  if brand_spoof else "ok"))
+        checks.append(("📏", "Long Subdomain",   "Suspicious length" if long_sub else "Normal",                    "warn" if long_sub    else "ok"))
+        checks.append(("➖", "Excess Dashes",    "Yes – common in spam" if excess_dash else "No",                  "warn" if excess_dash else "ok"))
+        checks.append(("🔢", "Numeric Subdomain","Yes – suspicious" if num_sub else "No",                          "warn" if num_sub     else "ok"))
+        checks.append(("📜", "URL Length",       f"{len(target)} chars – very long" if url_len_sus else f"{len(target)} chars – normal",  "warn" if url_len_sus else "ok"))
+        checks.append(("📡", "DNS Resolves",     resolved_ip if resolved_ok else "❌ Cannot resolve – suspicious!", "ok"   if resolved_ok else "bad"))
 
-def get_ai_analysis(target: str, score: int, flags, target_type: str, api_key: str) -> str:
-    flag_summary = "\n".join(f"{label}: {val} ({status})" for _, label, val, status in flags)
-    label, _, _ = score_meta(score)
-    prompt = f"""You are a cybersecurity expert analyzing a {target_type} for reputation and threats.
+        if spam_tld:     spam_score += 35
+        if ip_in_url:    spam_score += 30
+        if brand_spoof:  spam_score += 35
+        if not is_https: spam_score += 10
+        if long_sub:     spam_score += 10
+        if excess_dash:  spam_score += 10
+        if num_sub:      spam_score += 10
+        if not resolved_ok: spam_score += 20
+        if url_len_sus:  spam_score += 10
+        if is_trusted:   spam_score = max(0, spam_score - 30)
 
-Target: {target}
-Reputation Score: {score}/100
-Verdict: {label}
+    spam_score = min(100, spam_score)
+    return checks, spam_score
 
-Heuristic Analysis:
-{flag_summary}
+def verdict(score):
+    if score >= 65:
+        return ("🚨 SPAM / DANGEROUS",   "red",    "This link looks dangerous. Do NOT click it.")
+    elif score >= 35:
+        return ("⚠️  SUSPICIOUS",        "yellow", "Be careful. This link has several red flags.")
+    else:
+        return ("✅  LOOKS SAFE",         "green",  "No major red flags detected.")
 
-Give a concise threat analysis (4-6 sentences) covering:
-1. Overall threat assessment
-2. Specific risks or red flags detected
-3. What type of attack this might indicate (if malicious)
-4. Recommended action for a security analyst
-
-Be direct, technical, and specific. No markdown formatting. Plain text only."""
-
-    client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
-
-# ─── Display Functions ───────────────────────────────────────────────────────
-
+# ── Display ───────────────────────────────────────────────────────────────────
 def print_banner():
+    console.print()
     console.print(Text(BANNER, style="bold cyan"), justify="center")
-    console.print(Align.center(
-        Text("🛡  AI-Powered Cybersecurity Terminal Tool  🛡", style="bold white on dark_green")
-    ))
+    console.print(Align.center(Text("Anyone can use this! Just paste a link or IP below.", style="dim")))
     console.print()
 
-def print_result(target: str, flags, score: int, ai_text: str):
-    label, color, icon = score_meta(score)
-    target_type = "IP Address" if is_ip(target) else "URL"
+def show_result(target, checks, score):
+    label, color, summary = verdict(score)
 
-    # ── Header Panel ──────────────────────────────────────────────────────────
-    header_text = Text()
-    header_text.append(f"\n  {icon}  ", style=f"bold {color}")
-    header_text.append(f"{escape(target)}\n", style="bold white")
-    header_text.append(f"  Type: {target_type}  │  ", style="dim")
-    header_text.append(f"Score: ", style="dim")
-    header_text.append(f"{score}/100", style=f"bold {color}")
-    header_text.append(f"  │  Verdict: ", style="dim")
-    header_text.append(f"{label}\n", style=f"bold {color}")
-    header_text.append(f"  Scanned: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n", style="dim")
+    # Big verdict panel
+    bar_full  = int(score / 5)
+    bar_empty = 20 - bar_full
+    bar       = "█" * bar_full + "░" * bar_empty
 
-    console.print(Panel(header_text, border_style=color, expand=True))
+    verdict_text = Text()
+    verdict_text.append(f"\n  {label}\n", style=f"bold {color}")
+    verdict_text.append(f"  {summary}\n\n", style="white")
+    verdict_text.append(f"  Spam Risk:  ", style="dim")
+    verdict_text.append(f"{bar}", style=f"bold {color}")
+    verdict_text.append(f"  {score}%\n", style=f"bold {color}")
 
-    # ── Score Bar ─────────────────────────────────────────────────────────────
-    bar_filled = int(score / 5)
-    bar_empty  = 20 - bar_filled
-    bar_str    = "█" * bar_filled + "░" * bar_empty
-    console.print(f"  Reputation  [bold {color}]{bar_str}[/bold {color}]  [{color}]{score}%[/{color}]\n")
+    console.print(Panel(verdict_text, border_style=color, expand=True,
+                        title=f"[bold]Result for: [cyan]{escape(target[:70])}{'...' if len(target)>70 else ''}[/cyan][/bold]"))
+    console.print()
 
-    # ── Heuristics Table ──────────────────────────────────────────────────────
-    table = Table(
-        title="🔬 Heuristic Analysis",
-        box=box.ROUNDED,
-        border_style="bright_black",
-        header_style="bold cyan",
-        show_lines=True,
-        expand=True,
-    )
-    table.add_column("Check",    style="dim",          width=6)
-    table.add_column("Category", style="bold white",   min_width=18)
-    table.add_column("Result",   min_width=30)
-    table.add_column("Status",   justify="center",     width=10)
+    # Checks table
+    table = Table(box=box.ROUNDED, border_style="bright_black",
+                  header_style="bold cyan", show_lines=True, expand=True,
+                  title="🔍 Detailed Checks")
+    table.add_column("",         width=4)
+    table.add_column("Check",    style="bold white", min_width=18)
+    table.add_column("Finding",  min_width=35)
+    table.add_column("Status",   justify="center", width=10)
 
-    status_labels = {"ok": "[green]● SAFE[/green]", "warn": "[yellow]▲ WARN[/yellow]", "bad": "[red]✖ RISK[/red]", "info": "[cyan]ℹ INFO[/cyan]"}
+    status_map = {
+        "ok":   ("[green]● SAFE[/green]",   "green"),
+        "warn": ("[yellow]▲ WARN[/yellow]", "yellow"),
+        "bad":  ("[red]✖ RISK[/red]",       "red"),
+    }
 
-    for icon_f, label_f, val_f, status_f in flags:
-        col = STATUS_COLORS.get(status_f, "white")
-        table.add_row(
-            icon_f,
-            label_f,
-            f"[{col}]{escape(val_f)}[/{col}]",
-            status_labels.get(status_f, status_f)
-        )
+    for icon, name, value, status in checks:
+        label_str, col = status_map.get(status, ("ℹ INFO", "cyan"))
+        table.add_row(icon, name, f"[{col}]{escape(str(value))}[/{col}]", label_str)
 
     console.print(table)
     console.print()
 
-    # ── AI Analysis Panel ─────────────────────────────────────────────────────
-    ai_panel = Panel(
-        Text(ai_text, style="white"),
-        title="[bold magenta]🤖 AI Threat Intelligence[/bold magenta]",
-        border_style="magenta",
-        padding=(1, 2),
-    )
-    console.print(ai_panel)
-    console.print()
-
-    # ── Recommendations ───────────────────────────────────────────────────────
-    if score < 70:
-        recs = Table(box=box.SIMPLE, show_header=False, expand=True)
-        recs.add_column("R", style="yellow bold", width=3)
-        recs.add_column("Recommendation", style="white")
-        recs.add_row("►", "Cross-reference with [cyan]VirusTotal[/cyan] (virustotal.com)")
-        recs.add_row("►", "Check IP on [cyan]AbuseIPDB[/cyan] (abuseipdb.com)")
-        recs.add_row("►", "Lookup threat intel on [cyan]Shodan[/cyan] (shodan.io)")
-        if score < 40:
-            recs.add_row("►", "[red bold]Block this target immediately on your firewall/proxy[/red bold]")
-        console.print(Panel(recs, title="[yellow]📋 Recommended Actions[/yellow]", border_style="yellow"))
+    # Tip box
+    if score >= 35:
+        tips = [
+            "► Don't enter passwords or personal info on suspicious links",
+            "► You can verify at [cyan underline]virustotal.com[/cyan underline] (free, paste the link there)",
+            "► Forward suspicious emails to your IT/security team",
+        ]
+        if score >= 65:
+            tips.insert(0, "[red bold]► Do NOT click this link! Block the sender.[/red bold]")
+        tip_text = "\n".join(tips)
+        console.print(Panel(tip_text, title="[yellow]💡 What to do[/yellow]", border_style="yellow", padding=(0, 2)))
         console.print()
 
-# ─── Main Loop ───────────────────────────────────────────────────────────────
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print_banner()
-
-    # API Key
-    console.print(Panel(
-        "[dim]Enter your [bold cyan]Anthropic API Key[/bold cyan] for AI-powered analysis.\nGet one at [underline]console.anthropic.com[/underline]\nPress Enter to skip (heuristic-only mode)[/dim]",
-        border_style="bright_black",
-        padding=(0, 2)
-    ))
-    api_key = Prompt.ask("[cyan]  API Key[/cyan]", password=True, default="")
-    console.print()
-
-    console.print(Rule("[bold cyan]URL / IP Reputation Checker[/bold cyan]", style="cyan"))
-    console.print("[dim]  Enter a URL or IP address to analyze. Type [bold]exit[/bold] to quit.[/dim]\n")
+    console.print(Rule("[bold cyan]Spam & Link Checker[/bold cyan]", style="cyan"))
+    console.print("[dim]  Paste any link, URL, or IP address to check if it's spam.[/dim]")
+    console.print("[dim]  Type [bold]exit[/bold] to quit. No account or API key needed!\n[/dim]")
 
     while True:
         try:
-            target = Prompt.ask("[bold green]  Target[/bold green]").strip()
+            target = Prompt.ask("\n[bold green]  🔗 Paste link or IP[/bold green]").strip()
         except (KeyboardInterrupt, EOFError):
-            console.print("\n[bold cyan]  Goodbye! Stay safe online. 🛡[/bold cyan]\n")
+            console.print("\n[bold cyan]  Stay safe online! 🛡[/bold cyan]\n")
             break
 
         if not target:
+            console.print("[dim]  Please paste a link or IP address.[/dim]")
             continue
         if target.lower() in ("exit", "quit", "q"):
-            console.print("\n[bold cyan]  Goodbye! Stay safe online. 🛡[/bold cyan]\n")
+            console.print("\n[bold cyan]  Stay safe online! 🛡[/bold cyan]\n")
             break
 
         console.print()
+        with Progress(SpinnerColumn(style="cyan"), TextColumn("[cyan]Checking...[/cyan]"), transient=True) as p:
+            p.add_task("", total=None)
+            time.sleep(0.6)
+            checks, score = check_target(target)
 
-        # ── Heuristic Analysis ────────────────────────────────────────────────
-        with Progress(
-            SpinnerColumn(spinner_name="dots", style="cyan"),
-            TextColumn("[cyan]Running heuristic analysis...[/cyan]"),
-            transient=True,
-        ) as progress:
-            task = progress.add_task("", total=None)
-            time.sleep(0.8)
-            if is_ip(target):
-                flags = analyze_ip(target)
-                target_type = "IP address"
-            else:
-                flags = analyze_url(target)
-                target_type = "URL"
-            score = compute_score(flags)
-
-        # ── AI Analysis ───────────────────────────────────────────────────────
-        ai_text = ""
-        if api_key:
-            with Progress(
-                SpinnerColumn(spinner_name="dots2", style="magenta"),
-                TextColumn("[magenta]Consulting AI threat intelligence...[/magenta]"),
-                transient=True,
-            ) as progress:
-                progress.add_task("", total=None)
-                try:
-                    ai_text = get_ai_analysis(target, score, flags, target_type, api_key)
-                except Exception as e:
-                    ai_text = f"AI analysis failed: {str(e)}"
-        else:
-            ai_text = "AI analysis skipped — no API key provided.\nRun with a valid Anthropic API key for full threat intelligence."
-
-        print_result(target, flags, score, ai_text)
+        show_result(target, checks, score)
         console.print(Rule(style="bright_black"))
-        console.print()
 
 if __name__ == "__main__":
     main()
